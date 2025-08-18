@@ -1,0 +1,53 @@
+# Automotive Stocks Monitoring System Configuration
+
+# Database Configuration
+database:
+  host: "${MARIADB_HOST}"
+  port: "${MARIADB_PORT}"
+  name: "${MARIADB_DB}"
+  user: "${MARIADB_USER}"
+  password: "${MARIADB_PASSWORD}"
+  charset: "utf8mb4"
+
+# Telegram Configuration
+telegram:
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+  chat_id: "${TELEGRAM_CHAT_ID}"
+
+# Stock Configuration
+stocks:
+  sector: "Auto Manufacturers"
+  count: 10
+  criteria: "market_cap"  # Top 10 by market cap
+
+# Data Configuration
+data:
+  historical_days: 150  # Increased to ensure 90 trading days (accounts for weekends/holidays/data gaps)
+  averages:
+    short: 7
+    medium: 30
+    long: 90
+  market_hours:
+    start: "09:00"
+    end: "17:30"
+    timezone: "Europe/Vienna"  # Austria timezone
+
+# Schedule Configuration
+schedule:
+
+  timezone: "UTC"
+  real_time_monitoring: true  # Enable 30-minute updates
+  real_time_interval: 5  # Minutes between updates
+
+# Retry Configuration
+retry:
+  max_attempts: 3
+  backoff_seconds: 5
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/stock_monitor.log"
+  max_size_mb: 10
+  backup_count: 5

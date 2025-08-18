@@ -1,0 +1,40 @@
+[tool.poetry]
+name = "stock"
+version = "0.1.0"
+description = "Automotive Stocks Daily Fetch + Telegram Alert System"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "stock"}]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.9"
+yfinance = "^0.2.28"
+pandas = "^2.1.4"
+sqlalchemy = "^2.0.23"
+pymysql = "^1.1.0"
+apscheduler = "^3.10.4"
+python-telegram-bot = "^20.7"
+requests = "^2.31.0"
+python-dotenv = "^1.0.0"
+pyyaml = "^6.0.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+black = "^23.0.0"
+flake8 = "^6.0.0"
+mypy = "^1.5.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py39']
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true

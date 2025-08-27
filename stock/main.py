@@ -182,10 +182,14 @@ class StockMonitor:
             telegram_config = self.config['telegram']
             self.alert_system = TelegramAlertSystem(
                 bot_token=telegram_config['bot_token'],
-                chat_id=telegram_config['chat_id']
+                chat_id=telegram_config['chat_id'],
+                db_manager=self.db_manager
             )
             
-            self.logger.info("Alert system initialized successfully")
+            # Start the bot listener for interactive commands
+            self.alert_system.start_bot_listener()
+            
+            self.logger.info("Alert system and bot listener initialized successfully")
             
         except Exception as e:
             self.logger.error(f"Alert system initialization failed: {e}")
@@ -227,7 +231,16 @@ class StockMonitor:
                 name='Startup Sequence'
             )
             
-            self.logger.info(f"Scheduler initialized - real-time monitoring every {interval_minutes} minutes")
+            # Add watchlist sync job - check for new stocks every 2 minutes
+            self.scheduler.add_job(
+                self.sync_new_watchlist_stocks,
+                'interval',
+                minutes=2,
+                id='watchlist_sync',
+                name='Watchlist Synchronization'
+            )
+            
+            self.logger.info(f"Scheduler initialized - real-time monitoring every {interval_minutes} minutes, watchlist sync every 2 minutes")
             
         except Exception as e:
             self.logger.error(f"Failed to setup scheduler: {e}")
@@ -310,18 +323,60 @@ class StockMonitor:
                     
                     analysis_result = self.analytics.analyze_single_ticker(ticker)
                     
+                    # Debug: Log what analyze_single_ticker returns
+                    self.logger.info(f"DEBUG: analyze_single_ticker result for {ticker}: {analysis_result}")
+                    
                     if analysis_result and analysis_result.get('alerts_triggered', False):
                         self.logger.info(f"Real-time alert triggered for {ticker} - sending immediate alert")
                         
-                        full_analysis = self.analytics.analyze_all_tickers([ticker])
-                        if ticker in full_analysis:
-                            alert_result = full_analysis[ticker]
+                        # Debug: Log what's in triggered_averages
+                        triggered_averages = analysis_result.get('triggered_averages', [])
+                        self.logger.info(f"DEBUG: triggered_averages for {ticker}: {triggered_averages}")
+                        
+                        # Check database for alerts already sent today BEFORE sending
+                        alert_conditions = {}
+                        for period in [7, 30, 90]:
+                            period_key = f'{period}_day'
+                            # Check if this period has triggered alerts (from triggered_averages)
+                            if period_key in analysis_result.get('triggered_averages', []):
+                                # Check if alert was already sent today for this timeframe
+                                alert_already_sent = self.analytics.check_alert_already_sent_today(ticker, period_key)
+                                
+                                if not alert_already_sent:
+                                    # Get price difference data
+                                    price_diff = analysis_result.get('price_differences', {}).get(period_key, {})
+                                    
+                                    alert_conditions[period_key] = {
+                                        'average': analysis_result['averages'][period_key],
+                                        'absolute_difference': price_diff.get('difference', 0),
+                                        'percentage': price_diff.get('percentage', 0),
+                                        'alert_triggered': True  # Add this field that alert system expects
+                                    }
+                                    self.logger.info(f"Alert eligible for {ticker} {period_key} - not sent today")
+                                else:
+                                    self.logger.info(f"Alert already sent today for {ticker} {period_key} - skipping")
+                        
+                        if alert_conditions:
+                            # Create alert result with only new alerts
+                            alert_result = {
+                                'current_price': analysis_result['current_price'],
+                                'timestamp': analysis_result['timestamp'],
+                                'averages': analysis_result['averages'],
+                                'alert_conditions': alert_conditions
+                            }
+                            
+                            # Always save alerts to database first to prevent future duplicates
+                            self.logger.info(f"About to save {len(alert_conditions)} alert conditions to database for {ticker}")
+                            self._save_alerts_to_database(ticker, alert_conditions, analysis_result['current_price'])
+                            self.logger.info(f"Finished saving alerts to database for {ticker}")
+                            
+                            # Try to send the alert (but don't depend on it for database saving)
                             if self.alert_system.send_alert(ticker, alert_result):
                                 self.logger.info(f"Real-time alert sent successfully for {ticker}")
                             else:
-                                self.logger.error(f"Failed to send real-time alert for {ticker}")
+                                self.logger.error(f"Failed to send real-time alert for {ticker} (but alert saved to database)")
                         else:
-                            self.logger.warning(f"Could not get full analysis for {ticker} alert")
+                            self.logger.info(f"No new alerts to send for {ticker} - all conditions already alerted today")
             
             if stock_updates:
                 self.alert_system.send_real_time_update(stock_updates)
@@ -336,6 +391,38 @@ class StockMonitor:
             import traceback
             self.logger.error(f"Traceback: {traceback.format_exc()}")
     
+    def _save_alerts_to_database(self, ticker: str, alert_conditions: Dict, current_price: float) -> None:
+        """
+        Save alerts to database to prevent future duplicates.
+        """
+        try:
+            for period_key, condition in alert_conditions.items():
+                # Extract period number from key (e.g., '90_day' -> 90)
+                period_num = period_key.split('_')[0]
+                
+                # Calculate the difference and percentage
+                avg_value = condition['average']
+                diff = avg_value - current_price
+                pct_diff = (diff / avg_value) * 100
+                
+                # Save to database
+                success = self.db_manager.save_alert_to_database(
+                    ticker=ticker,
+                    alert_type=period_key,
+                    current_price=current_price,
+                    average_price=avg_value,
+                    absolute_difference=diff,
+                    percent_difference=pct_diff
+                )
+                
+                if success:
+                    self.logger.info(f"Alert saved to database for {ticker} {period_key}")
+                else:
+                    self.logger.error(f"Failed to save alert to database for {ticker} {period_key}")
+                    
+        except Exception as e:
+            self.logger.error(f"Error saving alerts to database for {ticker}: {e}")
+    
     def _is_new_trading_day(self, ticker: str, today) -> bool:
         try:
             from stock.database import DatabaseManager
@@ -347,7 +434,98 @@ class StockMonitor:
                 
         except Exception as e:
             self.logger.warning(f"Error checking if new trading day for {ticker}: {e}")
-            return True  
+            return True
+    
+    def sync_new_watchlist_stocks(self) -> None:
+        """
+        Check for new stocks added to the watchlist table and fetch their historical data.
+        This allows manual database additions to be automatically included in monitoring.
+        """
+        try:
+            self.logger.info("Checking for new stocks in watchlist...")
+            
+            # Get all active tickers from watchlist
+            current_watchlist = self.db_manager.get_all_tickers()
+            
+            if not current_watchlist:
+                self.logger.info("No active stocks in watchlist")
+                return
+            
+            # Check each ticker to see if it has historical data
+            new_stocks_found = []
+            
+            for ticker in current_watchlist:
+                # Check if we have any historical data for this ticker
+                try:
+                    from sqlalchemy import text
+                    with self.db_manager.engine.connect() as conn:
+                        query = "SELECT COUNT(*) FROM stock_daily WHERE ticker = :ticker"
+                        result = conn.execute(text(query), {"ticker": ticker})
+                        count = result.fetchone()[0]
+                        
+                        if count == 0:
+                            # This is a new stock without historical data
+                            new_stocks_found.append(ticker)
+                            self.logger.info(f"Found new stock in watchlist: {ticker}")
+                            
+                except Exception as e:
+                    self.logger.warning(f"Error checking historical data for {ticker}: {e}")
+                    # Assume it's new if we can't check
+                    new_stocks_found.append(ticker)
+            
+            if new_stocks_found:
+                self.logger.info(f"Fetching historical data for {len(new_stocks_found)} new stocks: {', '.join(new_stocks_found)}")
+                
+                # Fetch historical data for new stocks
+                for ticker in new_stocks_found:
+                    try:
+                        self.logger.info(f"Fetching historical data for new stock: {ticker}")
+                        historical_data = self.data_fetcher.fetch_historical_data(ticker, 150)
+                        
+                        if historical_data is not None and not historical_data.empty:
+                            self.db_manager.insert_historical_data(ticker, historical_data)
+                            self.logger.info(f"Successfully added historical data for {ticker}")
+                            
+                            # Send notification about new stock
+                            if self.alert_system:
+                                try:
+                                    watchlist_info = self.db_manager.get_watchlist()
+                                    stock_info = next((item for item in watchlist_info if item['ticker'] == ticker), None)
+                                    
+                                    if stock_info:
+                                        company_name = stock_info.get('company_name', ticker)
+                                        sector = stock_info.get('sector', 'Unknown')
+                                        
+                                        message = f"""
+🆕 <b>New Stock Added to Monitoring</b>
+
+🏢 <b>{ticker}</b> - {company_name}
+📂 <b>Sector:</b> {sector}
+📊 <b>Historical Data:</b> ✅ Loaded ({len(historical_data)} days)
+🔔 <b>Alerts:</b> Now active for this stock
+
+💡 Stock was detected from manual database addition
+⏰ <b>Added:</b> {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
+"""
+                                        self.alert_system.send_message(message)
+                                        self.logger.info(f"Sent notification for new stock: {ticker}")
+                                        
+                                except Exception as e:
+                                    self.logger.warning(f"Could not send notification for new stock {ticker}: {e}")
+                        else:
+                            self.logger.error(f"Failed to fetch historical data for {ticker}")
+                            
+                    except Exception as e:
+                        self.logger.error(f"Error processing new stock {ticker}: {e}")
+                
+                self.logger.info(f"Completed processing {len(new_stocks_found)} new stocks")
+            else:
+                self.logger.info("No new stocks found in watchlist")
+                
+        except Exception as e:
+            self.logger.error(f"Error in watchlist synchronization: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")  
     
 
     
@@ -374,11 +552,47 @@ class StockMonitor:
             for ticker, result in analysis_results.items():
                 if result.get('alerts_triggered', False):
                     self.logger.info(f"Alert triggered for {ticker} - sending alert")
-                    if self.alert_system.send_alert(ticker, result):
-                        alerts_sent += 1
-                        self.logger.info(f"Alert sent successfully for {ticker}")
+                    
+                    # Check database for alerts already sent today BEFORE sending
+                    alert_conditions = {}
+                    for period in [7, 30, 90]:
+                        period_key = f'{period}_day'
+                        if period_key in result.get('price_differences', {}):
+                            price_diff = result['price_differences'][period_key]
+                            
+                            # Check if alert was already sent today for this timeframe
+                            alert_already_sent = self.analytics.check_alert_already_sent_today(ticker, period_key)
+                            
+                            if not alert_already_sent:
+                                alert_conditions[period_key] = {
+                                    'average': result['averages'][period_key],
+                                    'absolute_difference': price_diff['difference'],
+                                    'percentage': price_diff['percentage'],
+                                    'alert_triggered': True  # Add this field that alert system expects
+                                }
+                                self.logger.info(f"Alert eligible for {ticker} {period_key} - not sent today")
+                            else:
+                                self.logger.info(f"Alert already sent today for {ticker} {period_key} - skipping")
+                    
+                    if alert_conditions:
+                        # Create alert result with only new alerts
+                        alert_result = {
+                            'current_price': result['current_price'],
+                            'timestamp': result['timestamp'],
+                            'averages': result['averages'],
+                            'alert_conditions': alert_conditions
+                        }
+                        
+                        if self.alert_system.send_alert(ticker, alert_result):
+                            alerts_sent += 1
+                            self.logger.info(f"Alert sent successfully for {ticker}")
+                            
+                            # Save alerts to database to prevent future duplicates
+                            self._save_alerts_to_database(ticker, alert_conditions, result['current_price'])
+                        else:
+                            self.logger.error(f"Failed to send alert for {ticker}")
                     else:
-                        self.logger.error(f"Failed to send alert for {ticker}")
+                        self.logger.info(f"No new alerts to send for {ticker} - all conditions already alerted today")
                 else:
                     self.logger.info(f"No alerts triggered for {ticker}")
             
@@ -429,6 +643,9 @@ class StockMonitor:
             
             if self.scheduler:
                 self.scheduler.shutdown()
+            
+            if self.alert_system:
+                self.alert_system.stop_bot_listener()
             
             if self.db_manager:
                 self.db_manager.close()

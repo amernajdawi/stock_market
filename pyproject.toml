@@ -18,6 +18,7 @@ python-telegram-bot = "^20.7"
 requests = "^2.31.0"
 python-dotenv = "^1.0.0"
 pyyaml = "^6.0.1"
+pytz = "^2023.3"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.0"

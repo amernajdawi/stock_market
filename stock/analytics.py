@@ -13,6 +13,80 @@ class StockAnalytics:
         self.db = database_manager
         self.average_periods = [7, 30, 90]  
     
+    def check_alert_already_sent_today(self, ticker: str, alert_type: str) -> bool:
+        """
+        Check if an alert was already sent today for a specific stock and timeframe.
+        This prevents duplicate alerts regardless of price changes.
+        
+        Alerts reset when the market opens (09:00 Vienna time), not at midnight.
+        
+        Args:
+            ticker: Stock ticker symbol (e.g., 'RACE')
+            alert_type: Alert type (e.g., '90_day', '30_day', '7_day')
+            
+        Returns:
+            bool: True if alert was already sent today, False if eligible for new alert
+        """
+        try:
+            if not self.db:
+                logger.error("Database manager not available")
+                return False
+            
+            # Calculate the current market session start time
+            # Market opens at 09:00 Vienna time (Europe/Vienna timezone)
+            from datetime import timezone, timedelta
+            import pytz
+            
+            # Vienna timezone
+            vienna_tz = pytz.timezone('Europe/Vienna')
+            utc_now = datetime.now(timezone.utc)
+            vienna_now = utc_now.astimezone(vienna_tz)
+            
+            # Today's market open at 09:00 Vienna time
+            market_open_vienna = vienna_now.replace(hour=9, minute=0, second=0, microsecond=0)
+            
+            # If current time is before 09:00 Vienna time, use yesterday's market open
+            if vienna_now.time() < market_open_vienna.time():
+                market_open_vienna = market_open_vienna - timedelta(days=1)
+            
+            # Convert market open time back to UTC for database comparison
+            market_open_utc = market_open_vienna.astimezone(timezone.utc)
+            
+            logger.debug(f"Checking alerts since market open: {market_open_utc} UTC ({market_open_vienna} Vienna)")
+            
+            # Check if alert was sent since market opened
+            query = """
+                SELECT COUNT(*) as alert_count
+                FROM alert_history
+                WHERE ticker = :ticker 
+                AND alert_type = :alert_type
+                AND sent_at >= :market_open
+            """
+            
+            try:
+                with self.db.engine.connect() as conn:
+                    from sqlalchemy import text
+                    # Use market open time instead of calendar day
+                    params = {"ticker": ticker, "alert_type": alert_type, "market_open": market_open_utc}
+                    result = conn.execute(text(query), params)
+                    row = result.fetchone()
+                    
+                    if row and row[0] > 0:
+                        logger.info(f"Alert already sent since market open for {ticker} {alert_type} - skipping")
+                        return True
+                    else:
+                        logger.info(f"No alert sent since market open for {ticker} {alert_type} - eligible for new alert")
+                        return False
+                        
+            except Exception as db_error:
+                logger.error(f"Database error checking alert history for {ticker} {alert_type}: {db_error}")
+                # If database check fails, assume no alert sent (safer approach)
+                return False
+                    
+        except Exception as e:
+            logger.error(f"Error checking alert history for {ticker} {alert_type}: {e}")
+            return False
+    
     def calculate_averages_for_ticker(self, ticker: str) -> Dict[str, Optional[float]]:
         try:
             logger.info(f"Calculating averages for {ticker}")

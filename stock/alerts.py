@@ -2,19 +2,26 @@
 
 import logging
 import asyncio
+import threading
+import time
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import requests
+import re
 
 logger = logging.getLogger(__name__)
 
 
 class TelegramAlertSystem:
     
-    def __init__(self, bot_token: str, chat_id: str):
+    def __init__(self, bot_token: str, chat_id: str, db_manager=None):
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
+        self.db_manager = db_manager
+        self.last_update_id = 0
+        self.bot_running = False
+        self.bot_thread = None
         
         if not self._test_connection():
             logger.error("Failed to establish Telegram connection")
@@ -226,7 +233,7 @@ Below: ${detail['difference']:.2f} ({detail['percentage']:.2f}%)"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 📈 <b>PORTFOLIO OVERVIEW</b>
-   🚗 Total Stocks: {total_stocks} Automotive Companies
+    Total Stocks: {total_stocks} 
    📊 Data Source: Yahoo Finance (Real-time)
    🔄 Monitoring: Active 24/7
 
@@ -352,19 +359,26 @@ Below: ${detail['difference']:.2f} ({detail['percentage']:.2f}%)"""
     def send_startup_notification(self, tickers: List[str]) -> bool:
         try:
             message = f"""
-🚀 <b>STOCK MONITORING SYSTEM STARTED</b> 🚀
+ <b>CUSTOM STOCK WATCHLIST ACTIVATED</b> 
 
-✅ <b>Status:</b> System is now running and monitoring stocks
+ <b>Status:</b> Personal monitoring system is now live
 
-📊 <b>Monitoring:</b> {len(tickers)} automotive stocks
-📋 <b>Tickers:</b> {', '.join(tickers)}
+ <b>Monitoring:</b> {len(tickers)} companies from your custom watchlist
+ <b>Tickers:</b> {', '.join(tickers)}
 
+ <b>Features:</b>
+   • Real-time price monitoring every 5 minutes
+   • Moving averages: 7, 30, 90 trading days
+   • Market-based alert reset (09:00 Vienna time)
+   • Add/remove companies via database
 
-🔔 <b>Alerts:</b> Enabled for prices below moving averages
+ <b>Alerts:</b> Telegram notifications when prices drop below averages
 
-⏰ <b>Started:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+ <b>Started:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
 
-🔍 <b>Automated by Stock Monitor</b>
+ <b>Tip:</b> Use manage_watchlist.py to add new companies anytime
+
+ <b>Powered by AI Stock Monitor</b>
 """
             
             return self.send_message(message)
@@ -405,7 +419,7 @@ Below: ${detail['difference']:.2f} ({detail['percentage']:.2f}%)"""
                 else:
                     market_status = '🔴 EU MARKETS CLOSED'
             
-            message = f"""🚀 <b>AUTOMOTIVE STOCKS LIVE UPDATE</b> 🚀
+            message = f""" <b>AUTOMOTIVE STOCKS LIVE UPDATE</b> 
 
 ⏰ {eu_time.strftime('%H:%M:%S')} {timezone_name} • {current_time.strftime('%H:%M:%S UTC')}
 🌍 Market: {market_status}
@@ -659,3 +673,290 @@ Below: ${detail['difference']:.2f} ({detail['percentage']:.2f}%)"""
             insights.append("• Market showing mixed signals - monitor individual stocks")
         
         return "\n".join(insights)
+    
+    def start_bot_listener(self):
+        """Start the Telegram bot listener in a separate thread"""
+        if not self.bot_running:
+            self.bot_running = True
+            self.bot_thread = threading.Thread(target=self._bot_polling_loop, daemon=True)
+            self.bot_thread.start()
+            logger.info("Telegram bot listener started")
+    
+    def stop_bot_listener(self):
+        """Stop the Telegram bot listener"""
+        self.bot_running = False
+        if self.bot_thread:
+            self.bot_thread.join(timeout=5)
+        logger.info("Telegram bot listener stopped")
+    
+    def _bot_polling_loop(self):
+        """Main polling loop for Telegram bot"""
+        while self.bot_running:
+            try:
+                self._process_updates()
+                time.sleep(2)  # Poll every 2 seconds
+            except Exception as e:
+                logger.error(f"Error in bot polling loop: {e}")
+                time.sleep(5)  # Wait longer on error
+    
+    def _process_updates(self):
+        """Process incoming Telegram updates"""
+        try:
+            url = f"{self.base_url}/getUpdates"
+            params = {
+                'offset': self.last_update_id + 1,
+                'timeout': 1,
+                'allowed_updates': ['message']
+            }
+            
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('ok'):
+                    updates = data.get('result', [])
+                    for update in updates:
+                        self._handle_update(update)
+                        self.last_update_id = update['update_id']
+        except Exception as e:
+            logger.error(f"Error processing Telegram updates: {e}")
+    
+    def _handle_update(self, update: Dict):
+        """Handle a single Telegram update"""
+        try:
+            message = update.get('message')
+            if not message:
+                return
+            
+            # Only process messages from the configured chat
+            if str(message['chat']['id']) != str(self.chat_id):
+                return
+            
+            text = message.get('text', '').strip()
+            if not text:
+                return
+            
+            logger.info(f"Received Telegram command: {text}")
+            
+            # Process the command
+            self._process_command(text)
+            
+        except Exception as e:
+            logger.error(f"Error handling Telegram update: {e}")
+    
+    def _process_command(self, text: str):
+        """Process a bot command"""
+        try:
+            text = text.lower().strip()
+            
+            # Help command
+            if text in ['help', '/help', '/start']:
+                self._send_help_message()
+            
+            # List watchlist command
+            elif text in ['list', '/list', 'watchlist', '/watchlist']:
+                self._send_watchlist()
+            
+            # Add stock command
+            elif text.startswith('add ') or text.startswith('/add '):
+                ticker = text.replace('add ', '').replace('/add ', '').strip().upper()
+                if ticker:
+                    self._add_stock_to_watchlist(ticker)
+                else:
+                    self.send_message("❌ Please specify a ticker symbol. Example: add AAPL")
+            
+            # Delete/remove stock command  
+            elif text.startswith('delete ') or text.startswith('/delete ') or text.startswith('remove ') or text.startswith('/remove '):
+                ticker = text.replace('delete ', '').replace('/delete ', '').replace('remove ', '').replace('/remove ', '').strip().upper()
+                if ticker:
+                    self._remove_stock_from_watchlist(ticker)
+                else:
+                    self.send_message("❌ Please specify a ticker symbol. Example: delete AAPL")
+            
+            # Status command
+            elif text in ['status', '/status']:
+                self._send_status_message()
+            
+            else:
+                self.send_message(f"❓ Unknown command: {text}\n\nType 'help' to see available commands.")
+                
+        except Exception as e:
+            logger.error(f"Error processing command '{text}': {e}")
+            self.send_message("❌ Error processing your command. Please try again.")
+    
+    def _send_help_message(self):
+        """Send help message with available commands"""
+        help_text = """
+🤖 <b>Stock Monitor Bot Commands</b>
+
+📋 <b>Watchlist Management:</b>
+• <code>add TICKER</code> - Add stock to watchlist
+• <code>delete TICKER</code> - Remove stock from watchlist  
+• <code>list</code> - Show current watchlist
+• <code>status</code> - Show system status
+
+💡 <b>Examples:</b>
+• <code>add AAPL</code> - Add Apple to watchlist
+• <code>delete TSLA</code> - Remove Tesla from watchlist
+• <code>list</code> - Show all monitored stocks
+
+ℹ️ <b>Notes:</b>
+• Commands are case-insensitive
+• Stock symbols should be valid Yahoo Finance tickers
+• Changes take effect immediately
+• You'll receive alerts for all watchlist stocks
+
+🔍 Type any command to get started!
+"""
+        self.send_message(help_text)
+    
+    def _send_watchlist(self):
+        """Send current watchlist"""
+        try:
+            if not self.db_manager:
+                self.send_message("❌ Database not available")
+                return
+            
+            watchlist = self.db_manager.get_watchlist()
+            
+            if not watchlist:
+                self.send_message("📋 Your watchlist is empty.\n\nUse <code>add TICKER</code> to add stocks!")
+                return
+            
+            message = "📊 <b>Your Stock Watchlist</b>\n\n"
+            
+            for item in watchlist:
+                ticker = item['ticker']
+                company_name = item.get('company_name', 'Unknown Company')
+                sector = item.get('sector', 'Unknown')
+                added_date = item.get('added_at', 'Unknown')
+                
+                if isinstance(added_date, str):
+                    try:
+                        from datetime import datetime
+                        added_date = datetime.fromisoformat(added_date.replace('Z', '+00:00'))
+                        date_str = added_date.strftime('%Y-%m-%d')
+                    except:
+                        date_str = str(added_date)
+                else:
+                    date_str = added_date.strftime('%Y-%m-%d') if added_date else 'Unknown'
+                
+                message += f"🏢 <b>{ticker}</b> - {company_name}\n"
+                message += f"   📂 {sector} | 📅 Added: {date_str}\n\n"
+            
+            message += f"📈 <b>Total:</b> {len(watchlist)} stocks monitored\n"
+            message += "\n💡 Use <code>add TICKER</code> or <code>delete TICKER</code> to manage your list"
+            
+            self.send_message(message)
+            
+        except Exception as e:
+            logger.error(f"Error sending watchlist: {e}")
+            self.send_message("❌ Error retrieving watchlist")
+    
+    def _add_stock_to_watchlist(self, ticker: str):
+        """Add stock to watchlist"""
+        try:
+            if not self.db_manager:
+                self.send_message("❌ Database not available")
+                return
+            
+            # Validate ticker format
+            if not re.match(r'^[A-Z0-9.-]{1,16}$', ticker):
+                self.send_message(f"❌ Invalid ticker format: {ticker}\n\nTicker should contain only letters, numbers, dots, and dashes (max 16 characters)")
+                return
+            
+            # Try to get company info from Yahoo Finance
+            try:
+                import yfinance as yf
+                stock = yf.Ticker(ticker)
+                info = stock.info
+                company_name = info.get('longName', info.get('shortName', ticker))
+                sector = info.get('sector', 'Unknown')
+            except:
+                company_name = ticker
+                sector = 'Unknown'
+                logger.warning(f"Could not fetch company info for {ticker}")
+            
+            # Add to database
+            success = self.db_manager.add_company_to_watchlist(
+                ticker=ticker,
+                company_name=company_name,
+                sector=sector
+            )
+            
+            if success:
+                message = f"✅ <b>Added to Watchlist</b>\n\n"
+                message += f"🏢 <b>{ticker}</b> - {company_name}\n"
+                message += f"📂 Sector: {sector}\n"
+                message += f"📅 Added: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+                message += f"🔔 You'll now receive alerts for {ticker} when price drops below moving averages!"
+                
+                self.send_message(message)
+                logger.info(f"Successfully added {ticker} to watchlist via Telegram")
+            else:
+                self.send_message(f"❌ Failed to add {ticker} to watchlist. It may already exist or there was a database error.")
+                
+        except Exception as e:
+            logger.error(f"Error adding {ticker} to watchlist: {e}")
+            self.send_message(f"❌ Error adding {ticker} to watchlist: {str(e)}")
+    
+    def _remove_stock_from_watchlist(self, ticker: str):
+        """Remove stock from watchlist"""
+        try:
+            if not self.db_manager:
+                self.send_message("❌ Database not available")
+                return
+            
+            # Check if ticker exists first
+            watchlist = self.db_manager.get_watchlist()
+            ticker_exists = any(item['ticker'].upper() == ticker.upper() for item in watchlist)
+            
+            if not ticker_exists:
+                self.send_message(f"❌ <b>{ticker}</b> is not in your watchlist.\n\nUse <code>list</code> to see current watchlist.")
+                return
+            
+            # Remove from database
+            success = self.db_manager.remove_company_from_watchlist(ticker)
+            
+            if success:
+                message = f"🗑️ <b>Removed from Watchlist</b>\n\n"
+                message += f"🏢 <b>{ticker}</b> has been removed\n"
+                message += f"📅 Removed: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+                message += f"🔕 You'll no longer receive alerts for {ticker}"
+                
+                self.send_message(message)
+                logger.info(f"Successfully removed {ticker} from watchlist via Telegram")
+            else:
+                self.send_message(f"❌ Failed to remove {ticker} from watchlist. Database error occurred.")
+                
+        except Exception as e:
+            logger.error(f"Error removing {ticker} from watchlist: {e}")
+            self.send_message(f"❌ Error removing {ticker} from watchlist: {str(e)}")
+    
+    def _send_status_message(self):
+        """Send system status message"""
+        try:
+            if not self.db_manager:
+                self.send_message("❌ Database not available")
+                return
+            
+            watchlist = self.db_manager.get_watchlist()
+            
+            message = f"📊 <b>Stock Monitor Status</b>\n\n"
+            message += f"✅ <b>System:</b> Running\n"
+            message += f"📋 <b>Watchlist:</b> {len(watchlist)} stocks\n"
+            message += f"🔔 <b>Alerts:</b> Active\n"
+            message += f"⏰ <b>Monitoring:</b> Every 5 minutes\n"
+            message += f"📈 <b>Averages:</b> 7, 30, 90 trading days\n\n"
+            
+            if watchlist:
+                tickers = [item['ticker'] for item in watchlist]
+                message += f"🏢 <b>Monitored Stocks:</b>\n{', '.join(tickers)}\n\n"
+            
+            message += f"🕐 <b>Status Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+            message += f"💡 Use <code>help</code> to see available commands"
+            
+            self.send_message(message)
+            
+        except Exception as e:
+            logger.error(f"Error sending status message: {e}")
+            self.send_message("❌ Error retrieving system status")

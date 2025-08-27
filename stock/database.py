@@ -8,7 +8,7 @@ from decimal import Decimal
 import pandas as pd
 from sqlalchemy import (
     create_engine, MetaData, Table, Column, String, Date, 
-    DateTime, Numeric, BigInteger, Text, Index, UniqueConstraint
+    DateTime, Numeric, BigInteger, Text, Index, UniqueConstraint, Enum, Boolean, Integer
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
@@ -59,6 +59,40 @@ class DatabaseManager:
             Column('fetched_at', DATETIME, nullable=False, default=datetime.utcnow),
             
             Index('idx_latest_fetched_at', 'fetched_at')
+        )
+        
+        self.alert_history = Table(
+            'alert_history',
+            self.metadata,
+            Column('id', BigInteger, primary_key=True, autoincrement=True),
+            Column('ticker', String(16), nullable=False),
+            Column('alert_type', Enum('7_day', '30_day', '90_day', name='alert_type_enum'), nullable=False),
+            Column('current_price', Numeric(18, 6), nullable=False),
+            Column('average_price', Numeric(18, 6), nullable=False),
+            Column('absolute_difference', Numeric(18, 6), nullable=False),
+            Column('percent_difference', Numeric(10, 4), nullable=False),
+            Column('sent_at', DATETIME, nullable=False, default=datetime.utcnow),
+            
+            Index('idx_ticker', 'ticker'),
+            Index('idx_alert_type', 'alert_type'),
+            Index('idx_sent_at', 'sent_at')
+        )
+        
+        self.watchlist = Table(
+            'watchlist',
+            self.metadata,
+            Column('id', Integer, primary_key=True, autoincrement=True),
+            Column('ticker', String(16), nullable=False, unique=True),
+            Column('company_name', String(255)),
+            Column('sector', String(100), default='Custom'),
+            Column('added_at', DATETIME, nullable=False, default=datetime.utcnow),
+            Column('is_active', Boolean, default=True),
+            Column('notes', Text),
+            
+            Index('idx_ticker', 'ticker'),
+            Index('idx_sector', 'sector'),
+            Index('idx_active', 'is_active'),
+            Index('idx_added_at', 'added_at')
         )
     
     def connect(self) -> bool:
@@ -248,14 +282,16 @@ class DatabaseManager:
             return {}
     
     def get_all_tickers(self) -> List[str]:
+        """Get all active tickers from the watchlist table."""
         try:
             if not self.engine:
                 logger.error("Database not connected")
                 return []
             
             query = """
-                SELECT DISTINCT ticker
-                FROM stock_daily
+                SELECT ticker
+                FROM watchlist
+                WHERE is_active = TRUE
                 ORDER BY ticker
             """
             
@@ -266,7 +302,156 @@ class DatabaseManager:
             return tickers
             
         except SQLAlchemyError as e:
-            logger.error(f"Failed to get tickers: {e}")
+            logger.error(f"Failed to get tickers from watchlist: {e}")
+            return []
+    
+    def save_alert_to_database(self, ticker: str, alert_type: str, current_price: float, 
+                              average_price: float, absolute_difference: float, 
+                              percent_difference: float) -> bool:
+        """
+        Save an alert to the database to prevent duplicate alerts on the same day.
+        
+        Args:
+            ticker: Stock ticker symbol
+            alert_type: Alert type (7_day, 30_day, 90_day)
+            current_price: Current stock price
+            average_price: Moving average price
+            absolute_difference: Absolute price difference
+            percent_difference: Percentage difference
+            
+        Returns:
+            bool: True if alert saved successfully, False otherwise
+        """
+        try:
+            if not self.engine:
+                logger.error("Database not connected")
+                return False
+            
+            record = {
+                'ticker': ticker,
+                'alert_type': alert_type,
+                'current_price': current_price,
+                'average_price': average_price,
+                'absolute_difference': absolute_difference,
+                'percent_difference': percent_difference,
+                'sent_at': datetime.now()
+            }
+            
+            with self.engine.connect() as conn:
+                stmt = """
+                    INSERT INTO alert_history 
+                    (ticker, alert_type, current_price, average_price, absolute_difference, percent_difference, sent_at)
+                    VALUES (:ticker, :alert_type, :current_price, :average_price, :absolute_difference, :percent_difference, :sent_at)
+                """
+                conn.execute(text(stmt), {
+                    'ticker': ticker,
+                    'alert_type': alert_type,
+                    'current_price': current_price,
+                    'average_price': average_price,
+                    'absolute_difference': absolute_difference,
+                    'percent_difference': percent_difference,
+                    'sent_at': record['sent_at']
+                })
+                conn.commit()
+            
+            logger.info(f"Alert saved to database for {ticker} {alert_type}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save alert to database for {ticker} {alert_type}: {e}")
+            return False
+    
+    def add_company_to_watchlist(self, ticker: str, company_name: str = None, 
+                                sector: str = "Custom", notes: str = None) -> bool:
+        """Add a new company to the watchlist."""
+        try:
+            if not self.engine:
+                logger.error("Database not connected")
+                return False
+            
+            record = {
+                'ticker': ticker.upper(),
+                'company_name': company_name,
+                'sector': sector,
+                'notes': notes,
+                'added_at': datetime.now(),
+                'is_active': True
+            }
+            
+            with self.engine.connect() as conn:
+                stmt = """
+                    INSERT INTO watchlist (ticker, company_name, sector, notes, added_at, is_active)
+                    VALUES (:ticker, :company_name, :sector, :notes, :added_at, :is_active)
+                """
+                conn.execute(text(stmt), record)
+                conn.commit()
+            
+            logger.info(f"Added {ticker} to watchlist: {company_name or 'Unknown Company'}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to add {ticker} to watchlist: {e}")
+            return False
+    
+    def remove_company_from_watchlist(self, ticker: str) -> bool:
+        """Remove a company from the watchlist (set inactive)."""
+        try:
+            if not self.engine:
+                logger.error("Database not connected")
+                return False
+            
+            with self.engine.connect() as conn:
+                stmt = """
+                    UPDATE watchlist 
+                    SET is_active = FALSE 
+                    WHERE ticker = :ticker
+                """
+                result = conn.execute(text(stmt), {"ticker": ticker.upper()})
+                conn.commit()
+                
+                if result.rowcount > 0:
+                    logger.info(f"Removed {ticker} from active watchlist")
+                    return True
+                else:
+                    logger.warning(f"Ticker {ticker} not found in watchlist")
+                    return False
+            
+        except Exception as e:
+            logger.error(f"Failed to remove {ticker} from watchlist: {e}")
+            return False
+    
+    def get_watchlist(self, active_only: bool = True) -> List[Dict[str, Any]]:
+        """Get all companies in the watchlist."""
+        try:
+            if not self.engine:
+                logger.error("Database not connected")
+                return []
+            
+            query = """
+                SELECT ticker, company_name, sector, added_at, is_active, notes
+                FROM watchlist
+            """
+            if active_only:
+                query += " WHERE is_active = TRUE"
+            query += " ORDER BY added_at DESC"
+            
+            with self.engine.connect() as conn:
+                result = conn.execute(text(query))
+                watchlist = []
+                for row in result.fetchall():
+                    watchlist.append({
+                        'ticker': row[0],
+                        'company_name': row[1],
+                        'sector': row[2],
+                        'added_at': row[3],
+                        'is_active': row[4],
+                        'notes': row[5]
+                    })
+                
+            return watchlist
+            
+        except Exception as e:
+            logger.error(f"Failed to get watchlist: {e}")
             return []
     
     def close(self) -> None:

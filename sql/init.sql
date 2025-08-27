@@ -72,6 +72,39 @@ CREATE TABLE IF NOT EXISTS alert_history (
     INDEX idx_sent_at (sent_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Custom watchlist table for user-defined companies to monitor
+CREATE TABLE IF NOT EXISTS watchlist (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    ticker VARCHAR(16) NOT NULL UNIQUE,
+    company_name VARCHAR(255),
+    sector VARCHAR(100) DEFAULT 'Custom',
+    added_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    is_active BOOLEAN DEFAULT TRUE,
+    notes TEXT,
+    
+    INDEX idx_ticker (ticker),
+    INDEX idx_sector (sector),
+    INDEX idx_active (is_active),
+    INDEX idx_added_at (added_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Insert initial automotive companies into watchlist
+INSERT INTO watchlist (ticker, company_name, sector, notes) VALUES
+('TSLA', 'Tesla Inc', 'Auto Manufacturers', 'Electric vehicle leader'),
+('TM', 'Toyota Motor Corp', 'Auto Manufacturers', 'Japanese automotive giant'),
+('F', 'Ford Motor Co', 'Auto Manufacturers', 'American automotive company'),
+('GM', 'General Motors Co', 'Auto Manufacturers', 'American automotive company'),
+('BMW3.DE', 'BMW AG', 'Auto Manufacturers', 'German luxury automotive'),
+('MBGYY', 'Mercedes-Benz Group AG', 'Auto Manufacturers', 'German luxury automotive'),
+('VWAGY', 'Volkswagen AG', 'Auto Manufacturers', 'German automotive group'),
+('HMC', 'Honda Motor Co Ltd', 'Auto Manufacturers', 'Japanese automotive company'),
+('NSANY', 'Nissan Motor Co Ltd', 'Auto Manufacturers', 'Japanese automotive company'),
+('RACE', 'Ferrari NV', 'Auto Manufacturers', 'Italian luxury sports cars')
+ON DUPLICATE KEY UPDATE
+    company_name = VALUES(company_name),
+    sector = VALUES(sector),
+    notes = VALUES(notes);
+
 -- Insert initial system status
 INSERT INTO system_status (component, status, message) VALUES
 ('stock_monitor', 'stopped', 'System not yet started'),
